@@ -11,7 +11,9 @@
 ./music-studio/
 ├── music_studio_app.py                         # FastAPI 核心后端（SHA-256 Gatekeeper + GCSStorageManager + LyriaBestPracticeEngine + CostAnalyticsEngine 全链路成本核算）
 ├── music_studio_ui.html                        # 9-Tab 响应式全功能 Web UI 工作台（含 💰 全链路成本看板 & CSV 导出 + A/B/C 组 CSV 上传至 GCS 自动解析呈现 & 上传音频深度分析）
-├── deploy_cloud_run.sh                         # Cloud Run 一键部署脚本（零明文 SHA-256 Passcode 模式 + GCS FUSE 挂载）
+├── deploy_cloud_run.sh                         # Cloud Run 一键云端构建与部署脚本（自动创建专属服务账号 music-studio-sa + 零明文 SHA-256 门禁 + GCS FUSE 挂载）
+├── deploy.sh                                   # 与 deploy_cloud_run.sh 等价的快捷部署入口（对齐 diarization-studio 部署规范）
+├── cloudbuild.yaml                             # Google Cloud Build 原生全链路构建与部署流水线配置
 ├── Dockerfile                                  # Cloud Run 容器镜像构建定义（Python 3.11 + ffmpeg 响度与尾端淡出处理）
 ├── requirements.txt                            # Python 依赖声明
 ├── README.md                                   # 架构说明、GCS 自动装载指南、Lyria 3 提效机制与部署手册
@@ -220,7 +222,10 @@ sequenceDiagram
 
 ---
 
-## 4. Cloud Run 一键部署指南（支持零明文 SHA-256 Passcode 模式）
+## 4. Cloud Run 一键部署指南（专属最小权限服务账号 `music-studio-sa` + 零明文 SHA-256 门禁）
+
+脚本会自动完成：**启用必需 API → 自动创建专属服务账号 (`music-studio-sa@${PROJECT_ID}.iam.gserviceaccount.com`) → 绑定最小权限 IAM (`aiplatform.user` / `storage.objectUser` / `storage.objectAdmin` / `logging.logWriter`) → Cloud Build 独立构建镜像 → 挂载专属服务账号与 GCS FUSE 部署至 Cloud Run**。
+*(即便传入 `SKIP_IAM_SETUP="true"`，若检测到专属服务账号尚未创建，脚本仍会自动补建并绑定权限，防止出现 `NOT_FOUND` 错误)*
 
 进入项目目录：
 ```bash
@@ -236,7 +241,7 @@ GCS_BUCKET_NAME="your-gcs-bucket-name" \
 ./deploy_cloud_run.sh
 ```
 
-若 IAM 权限与 API 此前已配置完成，二次更新部署时可传入 `SKIP_IAM_SETUP="true"`（或命令行参数 `--skip-iam-setup`）直接跳过 API 启用与 IAM 策略绑定：
+若 IAM 权限与 API 此前已配置完成，二次更新部署时可传入 `SKIP_IAM_SETUP="true"`（若镜像已构建完成还可加 `SKIP_BUILD="true"` 直接极速部署）：
 ```bash
 PROMPT_PASSCODE="true" \
 SKIP_IAM_SETUP="true" \
@@ -261,4 +266,12 @@ GCS_BUCKET_NAME="your-gcs-bucket-name" \
 ./deploy_cloud_run.sh
 # 部署完成后通过本地安全代理访问：
 gcloud run services proxy music-studio --region us-central1 --port 8080
+```
+
+### 跨桶授权提示（读取客户其他 GCS Bucket 素材）
+若需要让平台读取其他外部 GCS Bucket 中的音频或题单素材，只需将该 Bucket 的读取权限授予专属服务账号 `music-studio-sa`：
+```bash
+gcloud storage buckets add-iam-policy-binding "gs://other-bucket-name" \
+  --member="serviceAccount:music-studio-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" \
+  --role="roles/storage.objectViewer"
 ```

@@ -447,12 +447,39 @@ Return ONLY a valid JSON object containing:
 5. `lyria_optimization_recipe`: Actionable recommendation on how to further refine the Lyria SongPlan / section captions to beat all current tracks."""
 
 
+def _detect_runtime_service_account(project_id: str) -> str:
+  env_sa = (
+      os.environ.get("MUSIC_STUDIO_SERVICE_ACCOUNT")
+      or os.environ.get("SA_EMAIL")
+      or ""
+  ).strip()
+  if env_sa:
+    return env_sa
+  if os.environ.get("K_SERVICE"):
+    try:
+      req = urllib.request.Request(
+          "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+          headers={"Metadata-Flavor": "Google"},
+      )
+      with urllib.request.urlopen(req, timeout=1.5) as resp:
+        email = resp.read().decode("utf-8", errors="ignore").strip()
+        if email:
+          return email
+    except Exception:
+      pass
+  pid = (project_id or "your-gcp-project-id").strip()
+  return f"music-studio-sa@{pid}.iam.gserviceaccount.com"
+
+
+_DEFAULT_PROJECT_ID = (
+    os.environ.get("GOOGLE_CLOUD_PROJECT")
+    or os.environ.get("CLOUD_ML_PROJECT_ID")
+    or "your-gcp-project-id"
+)
+
 DEFAULT_PLATFORM_CONFIG = {
-    "project_id": (
-        os.environ.get("GOOGLE_CLOUD_PROJECT")
-        or os.environ.get("CLOUD_ML_PROJECT_ID")
-        or "your-gcp-project-id"
-    ),
+    "project_id": _DEFAULT_PROJECT_ID,
+    "service_account": _detect_runtime_service_account(_DEFAULT_PROJECT_ID),
     "location": os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
     "gemini_model": os.environ.get("MUSIC_STUDIO_GEMINI_MODEL", "gemini-4-argon"),
     "gemini_thinking_level": os.environ.get(
@@ -5585,6 +5612,7 @@ async def api_health():
   return {
       "ok": True,
       "service": "music-studio",
+      "service_account": cfg.get("service_account") or _detect_runtime_service_account(cfg.get("project_id", "")),
       "gemini_model": cfg.get("gemini_model"),
       "gemini_thinking_level": cfg.get("gemini_thinking_level"),
       "lyria_default_model": cfg.get("lyria_default_model"),

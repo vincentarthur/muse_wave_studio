@@ -13,9 +13,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY music_studio_app.py /app/music_studio_app.py
 COPY music_studio_ui.html /app/music_studio_ui.html
-COPY data/ /app/data/
 
-RUN mkdir -p /app/workspace
+RUN mkdir -p /app/data /app/workspace
 
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
