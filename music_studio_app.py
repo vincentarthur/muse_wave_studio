@@ -64,10 +64,12 @@ import zipfile
 
 import fastapi
 from fastapi import Body, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 try:
   from google import genai
@@ -4737,6 +4739,63 @@ _JOBS_LAST_PERSIST_TS: dict[str, float] = {}
 LOCAL_TMP_JOBS_DIR = Path(tempfile.gettempdir()) / "music_studio_jobs_cache"
 LOCAL_TMP_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
+SINGLE_TASKS_REGISTRY: dict[str, dict] = {}
+SINGLE_TASKS_LOCK = threading.Lock()
+
+
+def _persist_single_task_state(task_id: str, upload_gcs: bool = False) -> None:
+  """Persists an async single-item task state to `/tmp` RAM cache and optionally to GCS."""
+  with SINGLE_TASKS_LOCK:
+    if task_id not in SINGLE_TASKS_REGISTRY:
+      return
+    snap = json.loads(json.dumps(SINGLE_TASKS_REGISTRY[task_id], default=str))
+
+  try:
+    (LOCAL_TMP_JOBS_DIR / f"{task_id}.json").write_text(
+        json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+  except Exception:
+    pass
+
+  if upload_gcs:
+    try:
+      GCS_MANAGER.upload_json(snap, f"single_tasks/{task_id}.json", force=True)
+    except Exception:
+      pass
+
+
+def _update_single_task_stage(
+    task_id: str,
+    stage: str,
+    stage_label: str,
+    upload_gcs: bool = False,
+) -> None:
+  """Updates the live stage progress of an async single task."""
+  if not task_id:
+    return
+  with SINGLE_TASKS_LOCK:
+    if task_id not in SINGLE_TASKS_REGISTRY:
+      return
+    SINGLE_TASKS_REGISTRY[task_id]["stage"] = stage
+    SINGLE_TASKS_REGISTRY[task_id]["stage_label"] = stage_label
+    SINGLE_TASKS_REGISTRY[task_id]["updated_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+  _persist_single_task_state(task_id, upload_gcs=upload_gcs)
+
+
+def _safe_write_json_file(path: Path, payload: dict) -> None:
+  """Safely writes JSON to disk with retry against transient GCS FUSE handle errors."""
+  serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+  for _attempt in range(3):
+    try:
+      path.write_text(serialized, encoding="utf-8")
+      return
+    except OSError:
+      time.sleep(0.08)
+    except Exception:
+      break
+
 
 def execute_single_generation_pipeline(req_data: dict) -> dict:
   """Runs the complete single-item generation pipeline:
@@ -4869,7 +4928,14 @@ def execute_single_generation_pipeline(req_data: dict) -> dict:
           "seed_offset": 202,
       },
   ]
+  task_id = str(req_data.get("_async_task_id") or "")
   if use_compiler:
+    _update_single_task_stage(
+        task_id,
+        "compiling_song_plan",
+        "🧠 正在调用 gemini-4-argon 编译多段落 SongPlan...",
+        upload_gcs=False,
+    )
     song_plan = LyriaBestPracticeEngine.compile_song_plan_with_gemini(
         mode=mode,
         user_prompt=user_prompt,
@@ -4912,6 +4978,12 @@ def execute_single_generation_pipeline(req_data: dict) -> dict:
   )
 
   if compile_only:
+    _update_single_task_stage(
+        task_id,
+        "archiving_gcs",
+        "☁️ 正在归档 SongPlan 至历史版本库与 GCS...",
+        upload_gcs=False,
+    )
     plan_record = {
         "generation_id": gen_id,
         "item_id": item_id,
@@ -4938,9 +5010,7 @@ def execute_single_generation_pipeline(req_data: dict) -> dict:
         plan_record, cfg=cfg
     )
     meta_path = GENERATED_DIR / f"{gen_id}.json"
-    meta_path.write_text(
-        json.dumps(plan_record, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _safe_write_json_file(meta_path, plan_record)
     plan_record["metadata_gcs"] = GCS_MANAGER.upload_json(
         plan_record, f"generations/{gen_id}.json"
     )
@@ -4952,6 +5022,13 @@ def execute_single_generation_pipeline(req_data: dict) -> dict:
         extra={"generation_id": gen_id, "latency_sec": round(time.time() - pipeline_t0, 2)},
     )
     return plan_record
+
+  _update_single_task_stage(
+      task_id,
+      "synthesizing_lyria",
+      f"🎵 正在调用 {lyria_model} 合成高保真完整音频 (目标 {clamped_dur:.0f}s)...",
+      upload_gcs=True,
+  )
 
   # Build parallel synthesis specs
   synth_specs = []
@@ -5019,6 +5096,13 @@ def execute_single_generation_pipeline(req_data: dict) -> dict:
 
   audio_res = parallel_tracks[0]
 
+  _update_single_task_stage(
+      task_id,
+      "archiving_gcs",
+      "☁️ 正在核算全链路成本并归档元数据至历史库与 GCS...",
+      upload_gcs=False,
+  )
+
   record = {
       "generation_id": gen_id,
       "item_id": item_id,
@@ -5050,9 +5134,7 @@ def execute_single_generation_pipeline(req_data: dict) -> dict:
   )
 
   meta_path = GENERATED_DIR / f"{gen_id}.json"
-  meta_path.write_text(
-      json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-  )
+  _safe_write_json_file(meta_path, record)
   record["metadata_gcs"] = GCS_MANAGER.upload_json(
       record, f"generations/{gen_id}.json"
   )
@@ -5074,6 +5156,87 @@ def execute_single_generation_pipeline(req_data: dict) -> dict:
       },
   )
   return record
+
+
+def _spawn_single_async_task(
+    task_kind: str,
+    item_id: str,
+    stage_label: str,
+    worker_fn,
+    *args,
+    **kwargs,
+) -> dict:
+  """Spawns a non-blocking background worker for a single-item task (`generate_single`, `compile_plan`, `analyze_audio`, `evaluate_compare`) so HTTP requests never hit gateway/proxy 504 timeouts."""
+  safe_item = re.sub(r"[^a-zA-Z0-9_-]", "_", str(item_id or "item"))[:32]
+  task_id = f"task_{task_kind}_{safe_item}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+  now_iso = datetime.now(timezone.utc).isoformat()
+  init_state = {
+      "ok": True,
+      "async_task": True,
+      "task_id": task_id,
+      "task_kind": task_kind,
+      "item_id": str(item_id or "custom"),
+      "status": "running",
+      "stage": "starting",
+      "stage_label": stage_label,
+      "created_at": now_iso,
+      "updated_at": now_iso,
+      "started_epoch": time.time(),
+      "elapsed_sec": 0.0,
+      "result": None,
+      "error": None,
+  }
+  with SINGLE_TASKS_LOCK:
+    SINGLE_TASKS_REGISTRY[task_id] = init_state
+  _persist_single_task_state(task_id, upload_gcs=True)
+
+  ctx = contextvars.copy_context()
+
+  def _runner():
+    t0 = time.time()
+    try:
+      res = ctx.run(worker_fn, *args, **kwargs)
+      with SINGLE_TASKS_LOCK:
+        if task_id in SINGLE_TASKS_REGISTRY:
+          SINGLE_TASKS_REGISTRY[task_id]["status"] = "completed"
+          SINGLE_TASKS_REGISTRY[task_id]["stage"] = "completed"
+          SINGLE_TASKS_REGISTRY[task_id]["stage_label"] = "✅ 已完成"
+          SINGLE_TASKS_REGISTRY[task_id]["updated_at"] = datetime.now(
+              timezone.utc
+          ).isoformat()
+          SINGLE_TASKS_REGISTRY[task_id]["elapsed_sec"] = round(
+              time.time() - t0, 2
+          )
+          SINGLE_TASKS_REGISTRY[task_id]["result"] = res
+      _persist_single_task_state(task_id, upload_gcs=True)
+    except Exception as exc:
+      err_msg = f"{type(exc).__name__}: {exc}"
+      log_runtime(
+          "ERROR",
+          "SINGLE_ASYNC_TASK_ERROR",
+          f"Async task '{task_id}' ({task_kind}) failed for '{item_id}': {err_msg}",
+          item_id=str(item_id),
+          extra={"task_id": task_id, "task_kind": task_kind},
+          exc=exc,
+      )
+      with SINGLE_TASKS_LOCK:
+        if task_id in SINGLE_TASKS_REGISTRY:
+          SINGLE_TASKS_REGISTRY[task_id]["status"] = "failed"
+          SINGLE_TASKS_REGISTRY[task_id]["stage"] = "failed"
+          SINGLE_TASKS_REGISTRY[task_id]["stage_label"] = f"❌ 失败: {err_msg}"
+          SINGLE_TASKS_REGISTRY[task_id]["updated_at"] = datetime.now(
+              timezone.utc
+          ).isoformat()
+          SINGLE_TASKS_REGISTRY[task_id]["elapsed_sec"] = round(
+              time.time() - t0, 2
+          )
+          SINGLE_TASKS_REGISTRY[task_id]["error"] = err_msg
+          SINGLE_TASKS_REGISTRY[task_id]["detail"] = err_msg
+      _persist_single_task_state(task_id, upload_gcs=True)
+
+  t = threading.Thread(target=_runner, daemon=True)
+  t.start()
+  return init_state
 
 
 def _persist_batch_job_state(
@@ -5302,6 +5465,63 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+):
+  """Guarantees that HTTPExceptions on `/api/*` routes always return valid JSON (never HTML)."""
+  if request.url.path.startswith("/api/"):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "ok": False,
+            "detail": str(exc.detail),
+            "error": str(exc.detail),
+            "status_code": exc.status_code,
+        },
+    )
+  return HTMLResponse(content=str(exc.detail), status_code=exc.status_code)
+
+
+@app.exception_handler(RequestValidationError)
+async def custom_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+):
+  """Guarantees that request validation errors always return clean JSON."""
+  msg = f"ValidationError: {exc.errors()}"
+  return JSONResponse(
+      status_code=422,
+      content={
+          "ok": False,
+          "detail": msg,
+          "error": msg,
+          "status_code": 422,
+      },
+  )
+
+
+@app.exception_handler(Exception)
+async def custom_unhandled_exception_handler(request: Request, exc: Exception):
+  """Guarantees that any unhandled exception in FastAPI/Starlette returns valid JSON instead of plain-text/HTML 500."""
+  err_msg = f"{type(exc).__name__}: {exc}"
+  log_runtime(
+      "ERROR",
+      "GLOBAL_EXCEPTION_HANDLER",
+      f"Unhandled exception on {request.method} {request.url.path}: {err_msg}",
+      extra={"path": request.url.path, "method": request.method},
+      exc=exc,
+  )
+  return JSONResponse(
+      status_code=500,
+      content={
+          "ok": False,
+          "detail": err_msg,
+          "error": err_msg,
+          "status_code": 500,
+      },
+  )
 
 
 @app.middleware("http")
@@ -5892,6 +6112,21 @@ async def api_compile_lyria_song_plan(payload: dict = Body(...)):
   """Compiles a request into a Lyria 3 Multi-Caption & SongPlan via `gemini-4-argon` (`thinking_level=medium`) without generating audio yet."""
   payload["compile_only"] = True
   item_id = payload.get("item_id") or "custom"
+  if payload.get("async_job"):
+    req_copy = dict(payload)
+
+    def _compile_worker():
+      return execute_single_generation_pipeline(req_copy)
+
+    init_state = _spawn_single_async_task(
+        task_kind="compile_plan",
+        item_id=str(item_id),
+        stage_label="🧠 正在调用 gemini-4-argon 编译多段落 SongPlan...",
+        worker_fn=_compile_worker,
+    )
+    req_copy["_async_task_id"] = init_state["task_id"]
+    return init_state
+
   try:
     ctx = contextvars.copy_context()
     return await asyncio.to_thread(
@@ -5912,6 +6147,21 @@ async def api_compile_lyria_song_plan(payload: dict = Body(...)):
 async def api_generate_single_music(payload: dict = Body(...)):
   """Generates 1..4 parallel music tracks using Gemini SongPlan Compiler + Lyria and archives to GCS."""
   item_id = payload.get("item_id") or "custom"
+  if payload.get("async_job"):
+    req_copy = dict(payload)
+
+    def _gen_worker():
+      return execute_single_generation_pipeline(req_copy)
+
+    init_state = _spawn_single_async_task(
+        task_kind="generate_single",
+        item_id=str(item_id),
+        stage_label="🚀 已提交单曲生成任务，正在初始化...",
+        worker_fn=_gen_worker,
+    )
+    req_copy["_async_task_id"] = init_state["task_id"]
+    return init_state
+
   try:
     ctx = contextvars.copy_context()
     return await asyncio.to_thread(
@@ -5932,6 +6182,49 @@ async def api_generate_single_music(payload: dict = Body(...)):
         exc=e,
     )
     raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+
+@app.get("/api/tasks/{task_id}")
+async def api_get_single_async_task(task_id: str):
+  """Polls the status and result of a non-blocking single task (`generate_single`, `compile_plan`, `analyze_audio`, `evaluate_compare`)."""
+  with SINGLE_TASKS_LOCK:
+    if task_id in SINGLE_TASKS_REGISTRY:
+      t_obj = dict(SINGLE_TASKS_REGISTRY[task_id])
+      if t_obj.get("status") == "running" and t_obj.get("started_epoch"):
+        t_obj["elapsed_sec"] = round(
+            time.time() - float(t_obj["started_epoch"]), 1
+        )
+      return t_obj
+
+  safe_tid = Path(task_id).name
+  tmp_tf = LOCAL_TMP_JOBS_DIR / f"{safe_tid}.json"
+  if tmp_tf.exists():
+    try:
+      cached = json.loads(tmp_tf.read_text(encoding="utf-8"))
+      if cached.get("status") in ("completed", "failed"):
+        return cached
+    except Exception:
+      pass
+
+  gcs_task = await asyncio.to_thread(
+      GCS_MANAGER.download_json, f"single_tasks/{safe_tid}.json"
+  )
+  if isinstance(gcs_task, dict) and gcs_task.get("task_id"):
+    try:
+      tmp_tf.write_text(
+          json.dumps(gcs_task, ensure_ascii=False, indent=2), encoding="utf-8"
+      )
+    except Exception:
+      pass
+    return gcs_task
+
+  if tmp_tf.exists():
+    try:
+      return json.loads(tmp_tf.read_text(encoding="utf-8"))
+    except Exception:
+      pass
+
+  raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
 
 
 @app.post("/api/generate/batch")
@@ -6191,6 +6484,19 @@ async def api_analyze_audio(payload: dict = Body(...)):
   audio_source = payload.get("audio_source") or payload.get("audio_url") or ""
   if not audio_source:
     raise HTTPException(status_code=400, detail="audio_source is required")
+  if payload.get("async_job"):
+    req_copy = dict(payload)
+    return _spawn_single_async_task(
+        task_kind="analyze_audio",
+        item_id=Path(str(audio_source)).stem[:28] or "audio",
+        stage_label="🔬 正在调用 gemini-4-argon 进行 16 维声学深度听审分析...",
+        worker_fn=run_deep_music_analysis,
+        audio_source=audio_source,
+        track_title_hint=req_copy.get("track_title_hint", ""),
+        reference_lyrics=req_copy.get("reference_lyrics", ""),
+        reference_prompt=req_copy.get("reference_prompt", ""),
+        custom_system_prompt=req_copy.get("custom_system_prompt"),
+    )
   try:
     ctx = contextvars.copy_context()
     return await asyncio.to_thread(
@@ -6250,6 +6556,23 @@ async def api_upload_and_analyze_audio(
 async def api_evaluate_compare(payload: dict = Body(...)):
   """Runs multi-track evaluation & comparison via `gemini-4-argon` (`thinking_level="MEDIUM"`)."""
   tracks = payload.get("tracks") or []
+  if payload.get("async_job"):
+    req_copy = dict(payload)
+    return _spawn_single_async_task(
+        task_kind="evaluate_compare",
+        item_id=f"arena_{len(tracks)}tracks",
+        stage_label="🏆 正在调用 gemini-4-argon 进行多轨联合盲测听审...",
+        worker_fn=run_multi_track_evaluation,
+        tracks=tracks,
+        target_prompt=req_copy.get("target_prompt", ""),
+        target_lyrics=req_copy.get("target_lyrics", ""),
+        target_genre=req_copy.get("target_genre", ""),
+        target_language=req_copy.get("target_language", ""),
+        target_vocal_gender=req_copy.get("target_vocal_gender", ""),
+        is_instrumental=bool(req_copy.get("is_instrumental", False)),
+        blind_mode=bool(req_copy.get("blind_mode", True)),
+        custom_system_prompt=req_copy.get("custom_system_prompt"),
+    )
   try:
     ctx = contextvars.copy_context()
     return await asyncio.to_thread(

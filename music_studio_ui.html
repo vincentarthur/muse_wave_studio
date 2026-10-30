@@ -1712,6 +1712,97 @@
     }
 
     // =========================================================================
+    // Resilient JSON Response Parser & Non-Blocking Async Task Poller
+    // (Eliminates "Unexpected token '<'" on HTML 401/403/502/503/504 Gateway Pages)
+    // =========================================================================
+    async function parseResponseJsonSafe(res) {
+      const rawText = await res.text();
+      if (!rawText || !rawText.trim()) {
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status} (${res.statusText || 'Empty error response'})`);
+        }
+        return {};
+      }
+      try {
+        return JSON.parse(rawText);
+      } catch (_parseErr) {
+        const trimmed = rawText.trim();
+        if (trimmed.startsWith("<") || /<html|<!doctype/i.test(trimmed)) {
+          const titleMatch = trimmed.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+          const h1Match = trimmed.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+          const htmlTitle = (titleMatch?.[1] || h1Match?.[1] || "")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+          let reason = "";
+          if (res.status === 401 || res.status === 403) {
+            reason = `HTTP ${res.status} 权限/认证拦截 (${htmlTitle || 'Forbidden/Unauthorized'}) — Cloud Run 认证会话或代理 Token 已过期，请刷新页面重新登录或检查 Cloud Run Security -> Authentication / Service Account 权限`;
+          } else if (res.status === 504 || res.status === 408) {
+            reason = `HTTP ${res.status} 网关超时 (${htmlTitle || 'Gateway Timeout'}) — 请求耗时超过上游网关/代理限制`;
+          } else if (res.status === 502 || res.status === 503) {
+            reason = `HTTP ${res.status} 服务网关异常 (${htmlTitle || 'Bad Gateway / Service Unavailable'}) — Cloud Run 容器可能因内存不足 (OOM) 重启或正在冷启动，建议确保内存 ≥ 4GiB (推荐 8GiB)`;
+          } else {
+            reason = `HTTP ${res.status} 服务端返回了 HTML 错误页而非 JSON (${htmlTitle || trimmed.slice(0, 80).replace(/\s+/g, ' ')})`;
+          }
+          const err = new Error(reason);
+          err.status = res.status;
+          err.isHtmlError = true;
+          throw err;
+        }
+        const err = new Error(`HTTP ${res.status} 响应格式异常: ${trimmed.slice(0, 140).replace(/\s+/g, " ")}`);
+        err.status = res.status;
+        throw err;
+      }
+    }
+
+    async function pollStudioSingleTask(taskId, options = {}) {
+      const {
+        onProgress = null,
+        pollIntervalMs = 2000,
+        maxWaitMs = 900000, // 15 minutes max
+      } = options;
+      const startTs = Date.now();
+      let consecutiveErrors = 0;
+
+      while (Date.now() - startTs < maxWaitMs) {
+        await new Promise(r => setTimeout(r, pollIntervalMs));
+        try {
+          const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+            headers: { "Cache-Control": "no-cache" },
+          });
+          const taskData = await parseResponseJsonSafe(res);
+          if (!res.ok) {
+            consecutiveErrors += 1;
+            if (consecutiveErrors >= 15) {
+              throw new Error(taskData.detail || taskData.error || `轮询任务状态失败 (HTTP ${res.status})`);
+            }
+            continue;
+          }
+          consecutiveErrors = 0;
+          if (typeof onProgress === "function") {
+            try { onProgress(taskData); } catch (_e) {}
+          }
+          if (taskData.status === "completed") {
+            return taskData.result;
+          }
+          if (taskData.status === "failed") {
+            throw new Error(taskData.detail || taskData.error || "后台任务执行失败");
+          }
+        } catch (err) {
+          // If it's a definitive task failure from backend, rethrow immediately
+          if (err && !err.isHtmlError && !/Failed to fetch|NetworkError|网关|HTTP 50[234]/i.test(err.message || "")) {
+            throw err;
+          }
+          consecutiveErrors += 1;
+          if (consecutiveErrors >= 15) {
+            throw err;
+          }
+        }
+      }
+      throw new Error("后台生成任务等待超时 (超过 15 分钟)");
+    }
+
+    // =========================================================================
     // Initialization
     // =========================================================================
     window.addEventListener("DOMContentLoaded", async () => {
@@ -1731,7 +1822,7 @@
     async function loadConfig() {
       try {
         const res = await fetch("/api/config");
-        const cfg = await res.json();
+        const cfg = await parseResponseJsonSafe(res);
         document.getElementById("cfgProjectId").value = cfg.project_id || "";
         document.getElementById("cfgLocation").value = cfg.location || "global";
         document.getElementById("cfgGeminiModel").value = cfg.gemini_model || "gemini-4-argon";
@@ -1818,7 +1909,7 @@
     async function loadDataset() {
       try {
         const res = await fetch("/api/dataset");
-        DATASET = await res.json();
+        DATASET = await parseResponseJsonSafe(res);
         const counts = DATASET.counts || {};
         const cntA = counts.group_a_lyrics ?? 0;
         const cntB = counts.group_b_prompts ?? 0;
@@ -1886,7 +1977,7 @@
       try {
         const res = await fetch(`/api/generations/index?sync_gcs=${syncGcs ? 'true' : 'false'}`);
         if (res.ok) {
-          const data = await res.json();
+          const data = await parseResponseJsonSafe(res);
           ITEM_HISTORY_MAP = data.by_item || {};
           const hdrCnt = document.getElementById("hdrHistoryCount");
           if (hdrCnt) hdrCnt.textContent = data.total_records || 0;
@@ -1935,7 +2026,7 @@
       try {
         const res = await fetch(`/api/generations/by-item/${encodeURIComponent(itemId)}?sync_gcs=true`);
         if (res.ok) {
-          const data = await res.json();
+          const data = await parseResponseJsonSafe(res);
           ITEM_HISTORY_MAP[itemId] = data.records || [];
           renderGroupSidebar(groupCode);
           renderGroupItemHistoryAndOutput(groupCode, itemId, 0);
@@ -2167,12 +2258,14 @@
       if (task) {
         btnComp.disabled = true;
         btnGen.disabled = true;
+        const elapsedSuffix = task.elapsedSec ? ` (${Math.round(task.elapsedSec)}s)` : "";
+        const customStage = task.stageLabel ? `${task.stageLabel}${elapsedSuffix}` : "";
         if (task.compileOnly) {
-          btnComp.innerHTML = `<span class="spinner"></span> [${escapeHtml(itemId)}] Gemini 正在编译 SongPlan...`;
+          btnComp.innerHTML = `<span class="spinner"></span> [${escapeHtml(itemId)}] ${escapeHtml(customStage || "Gemini 正在编译 SongPlan...")}`;
           btnGen.innerHTML = `🎵 2. 编译并生成音乐 (Lyria + 自动存入历史与 GCS)`;
         } else {
           btnComp.innerHTML = `🧠 1. 仅编译预览 Lyria SongPlan (gemini-4-argon)`;
-          btnGen.innerHTML = `<span class="spinner"></span> [${escapeHtml(itemId)}] 正在后台生成音乐 (可切换其他样本继续并发生成)...`;
+          btnGen.innerHTML = `<span class="spinner"></span> [${escapeHtml(itemId)}] ${escapeHtml(customStage || "正在后台生成音乐 (可切换其他样本继续并发生成)...")}`;
         }
       } else {
         btnComp.disabled = false;
@@ -2337,6 +2430,7 @@
           : "group_a_lyrics");
 
       const selItem = GROUP_STATE[groupCode]?.selectedItem;
+      const startedAtEpochMs = Date.now();
       const payload = {
         item_id: itemId,
         group: groupCode,
@@ -2354,10 +2448,17 @@
         parallel_candidates: parseInt(document.getElementById(`compParallelCandidates_${groupCode}`).value || "1", 10),
         ab_compare_raw: document.getElementById(`compAbCompareRaw_${groupCode}`).checked,
         compile_only: compileOnly,
+        async_job: true,
         reference_audio_url: (selItem && selItem.id === itemId) ? (selItem.result_audio_url || "") : "",
       };
 
-      IN_FLIGHT_ITEMS.set(itemId, { compileOnly, groupCode, startedAt: Date.now() });
+      IN_FLIGHT_ITEMS.set(itemId, {
+        compileOnly,
+        groupCode,
+        startedAt: startedAtEpochMs,
+        stageLabel: compileOnly ? "🧠 正在提交 SongPlan 编译任务..." : "🚀 正在提交生成任务...",
+        elapsedSec: 0,
+      });
       renderGroupSidebar(groupCode);
       updateGroupButtonsForCurrentItem(groupCode, itemId);
       renderBenchmarkTable();
@@ -2369,8 +2470,25 @@
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify(payload)
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Request failed");
+        const initData = await parseResponseJsonSafe(res);
+        if (!res.ok) throw new Error(initData.detail || initData.error || "Request failed");
+
+        let data = initData;
+        if (initData && initData.async_task && initData.task_id) {
+          data = await pollStudioSingleTask(initData.task_id, {
+            onProgress: (taskSnap) => {
+              const curTask = IN_FLIGHT_ITEMS.get(itemId);
+              if (curTask) {
+                curTask.stageLabel = taskSnap.stage_label || curTask.stageLabel;
+                curTask.elapsedSec = taskSnap.elapsed_sec || ((Date.now() - startedAtEpochMs) / 1000);
+                const viewingId = (document.getElementById(`compItemId_${groupCode}`)?.value || "").trim();
+                if (viewingId === itemId) {
+                  updateGroupButtonsForCurrentItem(groupCode, itemId);
+                }
+              }
+            }
+          });
+        }
 
         recordNewGenerationInMemory(data);
 
@@ -2388,7 +2506,32 @@
           showToast(`🧠 [${itemId}] gemini-4-argon 已完成 Lyria 3 SongPlan 编译！`);
         }
       } catch (e) {
-        showToast(`❌ [${itemId}] 操作失败: ${e.message}`);
+        // Fallback recovery check: if a transient proxy blip interrupted polling, check if GCS/workspace actually finished saving the new version
+        let recovered = false;
+        try {
+          const recRes = await fetch(`/api/generations/by-item/${encodeURIComponent(itemId)}?sync_gcs=true`);
+          if (recRes.ok) {
+            const recData = await parseResponseJsonSafe(recRes);
+            const recs = recData.records || [];
+            if (recs.length > 0 && recs[0].created_at) {
+              const newestMs = Date.parse(recs[0].created_at);
+              if (!isNaN(newestMs) && newestMs >= startedAtEpochMs - 5000) {
+                ITEM_HISTORY_MAP[itemId] = recs;
+                const currentViewingId = (document.getElementById(`compItemId_${groupCode}`)?.value || "").trim();
+                if (currentViewingId === itemId) {
+                  renderGroupItemHistoryAndOutput(groupCode, itemId, 0);
+                }
+                await refreshQuickPicks();
+                loadAndRenderCostDashboard(false);
+                showToast(`🎵 [${itemId}] 已从云端版本库自动恢复刚生成的最新曲目！`);
+                recovered = true;
+              }
+            }
+          }
+        } catch (_ignore) {}
+        if (!recovered) {
+          showToast(`❌ [${itemId}] 操作失败: ${(e && e.message) ? e.message.replace(/\s+/g, " ") : String(e)}`);
+        }
       } finally {
         IN_FLIGHT_ITEMS.delete(itemId);
         renderGroupSidebar(groupCode);
@@ -2594,7 +2737,7 @@
 
       try {
         const res = await fetch("/api/prompt-list/upload", { method: "POST", body: fd });
-        const data = await res.json();
+        const data = await parseResponseJsonSafe(res);
         if (!res.ok) {
           showToast(`❌ 上传与解析失败: ${data.detail || "Unknown error"}`);
           return;
@@ -2686,7 +2829,7 @@
             force_reload_dataset: true,
           })
         });
-        const data = await res.json();
+        const data = await parseResponseJsonSafe(res);
         await loadConfig();
         if (data && data.ok) {
           DISCOVERED_GCS_ASSETS = data;
@@ -2740,7 +2883,7 @@
             auto_load_dataset: true,
           })
         });
-        const data = await res.json();
+        const data = await parseResponseJsonSafe(res);
         if (data && data.ok) {
           DISCOVERED_GCS_ASSETS = data;
           const cntEl = document.getElementById("hdrGcsAudioCount");
@@ -2812,7 +2955,7 @@
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({ gs_uri: uri, mode: mode })
         });
-        const data = await res.json();
+        const data = await parseResponseJsonSafe(res);
         if (!res.ok) throw new Error(data.detail || "GCS dataset load failed");
 
         if (mode === "replace_builtin") {
@@ -2849,7 +2992,7 @@
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({ auto_match: true, bucket: bucketVal })
         });
-        const data = await res.json();
+        const data = await parseResponseJsonSafe(res);
         if (!res.ok) throw new Error(data.detail || "Auto-bind failed");
         await loadDataset();
         for (const g of ["A", "B", "C"]) {
@@ -2901,7 +3044,7 @@
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload)
       });
-      const data = await res.json();
+      const data = await parseResponseJsonSafe(res);
       if (!res.ok) {
         showToast(`❌ 启动整组批量任务失败: ${data.detail}`);
         return;
@@ -2931,7 +3074,7 @@
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload)
       });
-      const data = await res.json();
+      const data = await parseResponseJsonSafe(res);
       if (!res.ok) {
         showToast(`❌ 启动批量任务失败: ${data.detail}`);
         return;
@@ -2996,7 +3139,7 @@
             return;
           }
           consecutiveErrors = 0;
-          const job = await res.json();
+          const job = await parseResponseJsonSafe(res);
           if (!job || !job.job_id) return;
           renderBatchJobSnapshot(job);
 
@@ -3034,7 +3177,7 @@
     async function refreshQuickPicks() {
       try {
         const res = await fetch("/api/library");
-        const lib = await res.json();
+        const lib = await parseResponseJsonSafe(res);
         const sel = document.getElementById("analysisQuickPick");
         if (!sel) return;
         const gcsAudios = DISCOVERED_GCS_ASSETS.audio_assets || [];
@@ -3100,44 +3243,54 @@
         fd.append("file", inp.files[0]);
         if (bucketVal) fd.append("gcs_bucket", bucketVal);
 
+        const upRes = await fetch("/api/audio/upload", { method: "POST", body: fd });
+        const upData = await parseResponseJsonSafe(upRes);
+        if (!upRes.ok) throw new Error(upData.detail || upData.error || "Audio upload failed");
+        onPickAnalysisAudio(upData.audio_url);
+        if (gcsInfoEl) {
+          gcsInfoEl.style.display = "block";
+          const gcsUri = upData.gcs?.gs_uri;
+          gcsInfoEl.innerHTML = gcsUri
+            ? `✅ 已上传音频 <strong>${escapeHtml(upData.original_filename)}</strong> 并归档至 GCS: <code>${escapeHtml(gcsUri)}</code>`
+            : `✅ 已上传音频 <strong>${escapeHtml(upData.original_filename)}</strong> (本地工作区缓存)`;
+        }
+        await refreshQuickPicks();
+
         if (runImmediately) {
-          fd.append("reference_prompt", refPrompt || "");
-          fd.append("reference_lyrics", refLyrics || "");
-          const res = await fetch("/api/analyze/upload-and-run", { method: "POST", body: fd });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "Upload and analysis failed");
-          if (data.uploaded_audio && data.uploaded_audio.audio_url) {
-            onPickAnalysisAudio(data.uploaded_audio.audio_url);
-            if (gcsInfoEl) {
-              gcsInfoEl.style.display = "block";
-              const gcsUri = data.uploaded_audio.gcs?.gs_uri;
-              gcsInfoEl.innerHTML = gcsUri
-                ? `✅ 已上传音频 <strong>${escapeHtml(data.uploaded_audio.original_filename)}</strong> 并归档至 GCS: <code>${escapeHtml(gcsUri)}</code>`
-                : `✅ 已上传音频 <strong>${escapeHtml(data.uploaded_audio.original_filename)}</strong> (本地工作区缓存)`;
-            }
+          if (btnRun) {
+            btnRun.innerHTML = `<span class="spinner"></span> 音频已上传，正在调用 gemini-4-argon 深度听审分析...`;
           }
-          await refreshQuickPicks();
+          const anaRes = await fetch("/api/analyze/audio", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+              audio_source: upData.audio_url,
+              track_title_hint: upData.original_filename || "",
+              reference_prompt: refPrompt || "",
+              reference_lyrics: refLyrics || "",
+              async_job: true,
+            })
+          });
+          const initAna = await parseResponseJsonSafe(anaRes);
+          if (!anaRes.ok) throw new Error(initAna.detail || initAna.error || "Analysis failed");
+          const data = (initAna && initAna.async_task && initAna.task_id)
+            ? await pollStudioSingleTask(initAna.task_id, {
+                onProgress: (snap) => {
+                  if (btnRun) {
+                    btnRun.innerHTML = `<span class="spinner"></span> ${escapeHtml(snap.stage_label || 'gemini-4-argon 正在深度分析...')} (${Math.round(snap.elapsed_sec || 0)}s)`;
+                  }
+                }
+              })
+            : initAna;
           loadAndRenderCostDashboard(false);
           LAST_ANALYSIS_RECORD = data;
           renderMusicAnalysisResult(data);
           showToast("🔬 音频上传完成，gemini-4-argon 16维深度音乐分析已生成！");
         } else {
-          const res = await fetch("/api/audio/upload", { method: "POST", body: fd });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "Audio upload failed");
-          onPickAnalysisAudio(data.audio_url);
-          if (gcsInfoEl) {
-            gcsInfoEl.style.display = "block";
-            const gcsUri = data.gcs?.gs_uri;
-            gcsInfoEl.innerHTML = gcsUri
-              ? `✅ 已上传音频 <strong>${escapeHtml(data.original_filename)}</strong> 并归档至 GCS: <code>${escapeHtml(gcsUri)}</code>`
-              : `✅ 已上传音频 <strong>${escapeHtml(data.original_filename)}</strong> (点击右侧「开始分析」即可深度拆解)`;
-          }
-          await refreshQuickPicks();
-          showToast(`✅ 音频已上传 ${data.gcs?.uploaded ? '并已归档至 GCS' : ''}`);
+          showToast(`✅ 音频已上传 ${upData.gcs?.uploaded ? '并已归档至 GCS' : ''}`);
         }
       } catch (e) {
-        showToast(`❌ 音频上传/分析失败: ${e.message}`);
+        showToast(`❌ 音频上传/分析失败: ${(e && e.message) ? e.message.replace(/\s+/g, " ") : String(e)}`);
       } finally {
         if (btnRun) {
           btnRun.disabled = false;
@@ -3174,16 +3327,24 @@
             audio_source: src,
             reference_prompt: refPrompt,
             reference_lyrics: refLyrics,
+            async_job: true,
           })
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Analysis failed");
+        const initData = await parseResponseJsonSafe(res);
+        if (!res.ok) throw new Error(initData.detail || initData.error || "Analysis failed");
+        const data = (initData && initData.async_task && initData.task_id)
+          ? await pollStudioSingleTask(initData.task_id, {
+              onProgress: (snap) => {
+                btn.innerHTML = `<span class="spinner"></span> ${escapeHtml(snap.stage_label || 'gemini-4-argon 正在深度听审分析...')} (${Math.round(snap.elapsed_sec || 0)}s)`;
+              }
+            })
+          : initData;
         LAST_ANALYSIS_RECORD = data;
         renderMusicAnalysisResult(data);
         loadAndRenderCostDashboard(false);
         showToast("🔬 gemini-4-argon 深度音乐分析完成！");
       } catch (e) {
-        showToast(`❌ 分析失败: ${e.message}`);
+        showToast(`❌ 分析失败: ${(e && e.message) ? e.message.replace(/\s+/g, " ") : String(e)}`);
       } finally {
         btn.disabled = false;
         btn.innerHTML = oldHtml;
@@ -3446,7 +3607,7 @@
       const fd = new FormData();
       fd.append("file", inputEl.files[0]);
       const res = await fetch("/api/audio/upload", { method: "POST", body: fd });
-      const data = await res.json();
+      const data = await parseResponseJsonSafe(res);
       if (res.ok) {
         ARENA_SLOTS[idx].audio_source = data.audio_url;
         ARENA_SLOTS[idx].label = data.original_filename;
@@ -3552,14 +3713,22 @@
             target_vocal_gender: document.getElementById("arenaTargetVocal").value,
             is_instrumental: document.getElementById("arenaTargetVocal").value.toLowerCase().includes("instrumental"),
             blind_mode: document.getElementById("arenaBlindMode").checked,
+            async_job: true,
           })
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Evaluation failed");
+        const initData = await parseResponseJsonSafe(res);
+        if (!res.ok) throw new Error(initData.detail || initData.error || "Evaluation failed");
+        const data = (initData && initData.async_task && initData.task_id)
+          ? await pollStudioSingleTask(initData.task_id, {
+              onProgress: (snap) => {
+                btn.innerHTML = `<span class="spinner"></span> ${escapeHtml(snap.stage_label || 'gemini-4-argon 正在多轨联合听审评判...')} (${Math.round(snap.elapsed_sec || 0)}s)`;
+              }
+            })
+          : initData;
         renderArenaVerdict(data);
         showToast("🏆 多首音乐联合评判完成！");
       } catch (e) {
-        showToast(`❌ 评判失败: ${e.message}`);
+        showToast(`❌ 评判失败: ${(e && e.message) ? e.message.replace(/\s+/g, " ") : String(e)}`);
       } finally {
         btn.disabled = false;
         btn.innerHTML = oldHtml;
@@ -3683,7 +3852,7 @@
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload)
       });
-      const data = await res.json();
+      const data = await parseResponseJsonSafe(res);
       await loadConfig();
       const up = data.upload_test || {};
       const disc = data.discover || data.list_test || {};
@@ -3815,7 +3984,7 @@
       try {
         const params = new URLSearchParams({ limit: "250", level: lvl, item_id: q });
         const res = await fetch(`/api/logs?${params.toString()}`);
-        const data = await res.json();
+        const data = await parseResponseJsonSafe(res);
         const logs = data.logs || [];
         if (metaEl) {
           metaEl.textContent = `共展示最新 ${logs.length} 条全链路结构化日志 (同步输出至 Cloud Run Cloud Logging JSON stdout/stderr)`;
@@ -3872,7 +4041,7 @@
       try {
         const res = await fetch("/api/cost/dashboard");
         if (!res.ok) return;
-        const data = await res.json();
+        const data = await parseResponseJsonSafe(res);
         COST_STATE.report = data;
 
         // If user has generated tracks and hasn't explicitly chosen scope, keep current scope
@@ -4256,7 +4425,7 @@
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({ group: group || "ALL", scope: scope || "all_dataset" }),
         });
-        const data = await res.json();
+        const data = await parseResponseJsonSafe(res);
         if (!res.ok) throw new Error(data.detail || "Archive failed");
         if (COST_STATE.report) {
           COST_STATE.report.archived_reports = data.archived_reports || [];
@@ -4296,7 +4465,7 @@
         body: JSON.stringify({ pricing: pricingPatch }),
       });
       if (res.ok) {
-        COST_STATE.report = await res.json();
+        COST_STATE.report = await parseResponseJsonSafe(res);
         renderCostDashboardView();
         await reloadAllGenerations(false);
         showToast("✅ 计费单价与汇率已保存，全量曲目全链路成本已实时重新核算！");
