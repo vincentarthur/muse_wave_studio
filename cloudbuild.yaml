@@ -2,7 +2,7 @@
 # Google Cloud Build 原生全链路构建与部署流水线 (cloudbuild.yaml)
 # 用法:
 #   gcloud builds submit --config cloudbuild.yaml \
-#     --substitutions=_REGION=us-central1,_SERVICE_NAME=music-studio,_SA_NAME=music-studio-sa .
+#     --substitutions=_REGION=us-central1,_SERVICE_NAME=music-studio .
 # ==============================================================================
 steps:
   # Step 1: 使用 Cloud Build 构建容器镜像
@@ -21,12 +21,11 @@ steps:
       - 'push'
       - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:latest'
 
-  # Step 3: 部署镜像到 Cloud Run (显式绑定专属服务账号 music-studio-sa)
+  # Step 3: 部署镜像到 Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     id: 'deploy-cloud-run'
     entrypoint: 'gcloud'
     args:
-      - 'beta'
       - 'run'
       - 'deploy'
       - '${_SERVICE_NAME}'
@@ -34,18 +33,15 @@ steps:
       - '--region=${_REGION}'
       - '--project=$PROJECT_ID'
       - '--service-account=${_SA_NAME}@$PROJECT_ID.iam.gserviceaccount.com'
-      - '--allow-unauthenticated'
-      - '--no-invoker-iam-check'
       - '--execution-environment=gen2'
-      - '--no-cpu-throttling'
-      - '--session-affinity'
       - '--cpu=4'
       - '--memory=8Gi'
-      - '--timeout=3600'
+      - '--no-cpu-throttling'
+      - '--timeout=1800'
       - '--concurrency=20'
       - '--min-instances=0'
-      - '--max-instances=4'
-      - '--set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=global,MUSIC_STUDIO_SERVICE_ACCOUNT=${_SA_NAME}@$PROJECT_ID.iam.gserviceaccount.com,MUSIC_STUDIO_GEMINI_MODEL=gemini-4-argon,MUSIC_STUDIO_THINKING_LEVEL=MEDIUM,MUSIC_STUDIO_LYRIA_MODEL=lyria-3-pro-preview,GCS_OBJECT_PREFIX=${_GCS_OBJECT_PREFIX},CLOUD_LOGGING_JSON=true,PYTHONUNBUFFERED=1'
+      - '--max-instances=2'
+      - '--set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=global,MUSIC_STUDIO_SERVICE_ACCOUNT=${_SA_NAME}@$PROJECT_ID.iam.gserviceaccount.com,MUSIC_STUDIO_GEMINI_MODEL=gemini-4-argon,MUSIC_STUDIO_THINKING_LEVEL=MEDIUM,MUSIC_STUDIO_LYRIA_MODEL=lyria-3-pro-preview,GCS_OBJECT_PREFIX=${_GCS_OBJECT_PREFIX}'
 
 images:
   - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:latest'

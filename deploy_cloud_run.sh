@@ -133,6 +133,8 @@ if ! gcloud iam service-accounts describe "${SA_EMAIL}" --project="${PROJECT_ID}
     --display-name="Music Studio Service Account" \
     --project="${PROJECT_ID}" --quiet
   SA_JUST_CREATED="true"
+  echo "⏳ 等待 8 秒以确保新创建的 IAM 服务账号在全球端点完成同步（避免立即绑定角色时报 does not exist）..."
+  sleep 8
 fi
 
 if [[ "${SKIP_IAM_SETUP}" != "true" || "${SA_JUST_CREATED}" == "true" ]]; then
@@ -142,16 +144,21 @@ if [[ "${SKIP_IAM_SETUP}" != "true" || "${SA_JUST_CREATED}" == "true" ]]; then
     "roles/serviceusage.serviceUsageConsumer" \
     "roles/logging.logWriter" \
     "roles/storage.objectUser"; do
-    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    echo "   ├─ 正在绑定 ${ROLE} ..."
+    if ! gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
       --member="serviceAccount:${SA_EMAIL}" \
       --role="${ROLE}" \
       --condition=None \
-      --quiet >/dev/null 2>&1 || true
+      --quiet >/dev/null; then
+      echo "   ⚠️ 绑定 ${ROLE} 失败（若刚创建 SA 可能是同步延迟，正在重试一次...）"
+      sleep 5
+      gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+        --member="serviceAccount:${SA_EMAIL}" \
+        --role="${ROLE}" \
+        --condition=None \
+        --quiet >/dev/null || echo "   ❌ 绑定 ${ROLE} 仍失败：请检查当前账号是否拥有该项目的 Project IAM Admin (resourcemanager.projects.setIamPolicy) 或 Owner 权限！"
+    fi
   done
-  if [[ "${SA_JUST_CREATED}" == "true" ]]; then
-    echo "⏳ 等待 5 秒以确保新创建的 IAM 服务账号在全球端点完成同步..."
-    sleep 5
-  fi
 fi
 
 # 确保 Artifact Registry 镜像仓库存在，避免构建或推送时报 NOT_FOUND

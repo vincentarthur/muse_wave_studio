@@ -5288,7 +5288,7 @@ def _run_batch_job_worker(job_id: str, items: list[dict], options: dict):
 # ==============================================================================
 app = fastapi.FastAPI(
     title=STUDIO_APP_NAME_EN,
-    version="2.1.0",
+    version="1.1.0",
     description=(
         "MuseWave Studio — Music Creation, Deep Acoustic Intelligence & Multi-Track Evaluation Arena "
         "powered by Gemini (`gemini-4-argon`, thinking_level=medium) & Lyria 3."
