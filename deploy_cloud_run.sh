@@ -80,6 +80,9 @@ for arg in "$@"; do
     MUSIC_STUDIO_ACCESS_PASSCODE=*|RAW_PASSCODE=*)
       export MUSIC_STUDIO_ACCESS_PASSCODE="${arg#*=}"
       ;;
+    ALLOW_UNAUTHENTICATED=*)
+      export ALLOW_UNAUTHENTICATED="${arg#*=}"
+      ;;
   esac
 done
 
@@ -132,6 +135,38 @@ if [[ -n "${ACCESS_PASSCODE}" && -z "${PASSCODE_SHA256}" ]]; then
     PASSCODE_SHA256="$(printf '%s' "${ACCESS_PASSCODE}" | shasum -a 256 | awk '{print $1}')"
   fi
   unset ACCESS_PASSCODE
+fi
+
+# 2b. If PASSCODE_SHA256 was not provided on this run, automatically inherit any existing
+#     MUSIC_STUDIO_PASSCODE_SHA256 from the currently deployed Cloud Run service so re-deploys
+#     never accidentally wipe the passcode or flip the service to --no-allow-unauthenticated.
+if [[ -z "${PASSCODE_SHA256}" && "${ENABLE_IAP}" != "true" && "${FORCE_IAM_ONLY:-false}" != "true" ]]; then
+  EXISTING_HASH="$(gcloud run services describe "${SERVICE_NAME}" \
+    --project="${PROJECT_ID}" \
+    --region="${REGION}" \
+    --format="value(spec.template.spec.containers[0].env[?(@.name=='MUSIC_STUDIO_PASSCODE_SHA256')].value)" 2>/dev/null || true)"
+  if [[ -z "${EXISTING_HASH}" ]]; then
+    # Fallback Python parser for gcloud JSON output across SDK versions
+    EXISTING_HASH="$(gcloud run services describe "${SERVICE_NAME}" \
+      --project="${PROJECT_ID}" \
+      --region="${REGION}" \
+      --format=json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    envs = d.get('spec', {}).get('template', {}).get('spec', {}).get('containers', [{}])[0].get('env', [])
+    for e in envs:
+        if e.get('name') == 'MUSIC_STUDIO_PASSCODE_SHA256' and e.get('value'):
+            print(e['value'])
+            break
+except Exception:
+    pass
+" 2>/dev/null || true)"
+  fi
+  if [[ -n "${EXISTING_HASH}" ]]; then
+    PASSCODE_SHA256="${EXISTING_HASH}"
+    echo "🔑 自动继承云端已配置的 SHA-256 门禁口令哈希 (${PASSCODE_SHA256:0:12}...)"
+  fi
 fi
 
 echo "=================================================================="
@@ -268,8 +303,11 @@ DEPLOY_ARGS=(
 
 if [[ -n "${PASSCODE_SHA256}" ]]; then
   echo "🔐 启用【方案二：零明文 SHA-256 登录门禁模式】— 云端仅存储 SHA-256 哈希 (${PASSCODE_SHA256:0:12}...)"
-  DEPLOY_ARGS+=(--allow-unauthenticated)
+  DEPLOY_ARGS+=(--allow-unauthenticated --no-invoker-iam-check)
   ENV_VARS="${ENV_VARS},MUSIC_STUDIO_PASSCODE_SHA256=${PASSCODE_SHA256}"
+elif [[ "${ALLOW_UNAUTHENTICATED:-false}" == "true" ]]; then
+  echo "🌐 启用【免 IAM 网关鉴权访问模式 (--allow-unauthenticated --no-invoker-iam-check)】"
+  DEPLOY_ARGS+=(--allow-unauthenticated --no-invoker-iam-check)
 elif [[ "${ENABLE_IAP}" == "true" ]]; then
   echo "🛡️ 启用【方案三：Cloud Run 原生 IAP (Identity-Aware Proxy)】"
   DEPLOY_ARGS+=(--no-allow-unauthenticated --iap)
@@ -289,6 +327,21 @@ fi
 DEPLOY_ARGS+=(--set-env-vars "${ENV_VARS}")
 
 gcloud "${DEPLOY_ARGS[@]}"
+
+# 兜底确保在受限组织策略 (Domain Restricted Sharing) 下也能放行浏览器访问至内置 SHA-256 门禁
+if [[ -n "${PASSCODE_SHA256}" || "${ALLOW_UNAUTHENTICATED:-false}" == "true" ]]; then
+  gcloud beta run services update "${SERVICE_NAME}" \
+    --project="${PROJECT_ID}" \
+    --region="${REGION}" \
+    --no-invoker-iam-check \
+    --quiet >/dev/null 2>&1 || true
+  gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+    --project="${PROJECT_ID}" \
+    --region="${REGION}" \
+    --member="allUsers" \
+    --role="roles/run.invoker" \
+    --quiet >/dev/null 2>&1 || true
+fi
 
 SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" --project="${PROJECT_ID}" --region="${REGION}" --format='value(status.url)' 2>/dev/null || echo "https://${SERVICE_NAME}-xxxx.${REGION}.run.app")"
 

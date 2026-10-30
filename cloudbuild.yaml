@@ -34,6 +34,8 @@ steps:
       - '--region=${_REGION}'
       - '--project=$PROJECT_ID'
       - '--service-account=${_SA_NAME}@$PROJECT_ID.iam.gserviceaccount.com'
+      - '--allow-unauthenticated'
+      - '--no-invoker-iam-check'
       - '--execution-environment=gen2'
       - '--no-cpu-throttling'
       - '--session-affinity'
